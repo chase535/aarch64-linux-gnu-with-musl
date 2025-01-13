@@ -1,0 +1,460 @@
+name: Build
+
+on:
+  workflow_dispatch:
+#   push:
+#     branches:
+#       - 'main'
+#     paths:
+#       - '.github/workflows/build.yml'
+#   pull_request:
+#     branches:
+#       - 'main'
+  schedule:
+    - cron: '0 1 * * 1'
+
+env:
+  GITHUB_USER: "${{ secrets.USERNAME }}"
+  GITHUB_EMAIL: "${{ secrets.EMAIL }}"
+  GITHUB_TOKEN: "${{ secrets.API_TOKEN_GITHUB }}"
+  HOME: "${{ github.workspace }}"
+  CLONE_DIR: "${{ github.workspace }}/git_clone"
+  SOURCE_DIR: "${{ github.workspace }}/source"
+  OUTPUT_DIR: "${{ github.workspace }}/output"
+  BUILD_DIR: "${{ github.workspace }}/build"
+  WGET_DIR: "${{ github.workspace }}/wget"
+  MPREFIX: "${{ github.workspace }}/output/toolchain"
+  MSYSROOT: "${{ github.workspace }}/output/sysroot"
+  PATH: "${{ github.workspace }}/output/toolchain/bin:/usr/bin:/bin"
+  CFLAGS: "-g0 -O2"
+  CXXFLAGS: "-g0 -O2"
+  LDFLAGS: "-g0 -O2 -Wl,-O2,--hash-style=both"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  delete-old-workflow-runs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ secrets.API_TOKEN_GITHUB }}
+          repository: ${{ github.repository }}
+          retain_days: 0
+          keep_minimum_runs: 0
+          delete_workflow_pattern: 'Build'
+
+  make-headers:
+    name: make-${{ matrix.select }}-headers
+    runs-on: ubuntu-latest
+    outputs:
+      LINUX_COMMIT_ID: ${{ steps.commit_id.outputs.LINUX_COMMIT_ID }}
+      MUSL_COMMIT_ID: ${{ steps.commit_id.outputs.MUSL_COMMIT_ID }}
+    env:
+      SELECT: "${{ matrix.select }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        select:
+          - linux
+          - musl
+    steps:
+      - name: Wget html file
+        run: |
+          if [[ "${SELECT}" == "linux" ]]; then
+            wget -P ${HOME} -O "${SELECT}.html" https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/commit
+          elif [[ "${SELECT}" == "musl" ]]; then
+            wget -P ${HOME} -O "${SELECT}.html" https://git.musl-libc.org/cgit/musl/commit
+          fi
+      - name: Get latest git commit id
+        id: commit_id
+        run: |
+          HASH=$(grep '<th>commit</th>' ${HOME}/${SELECT}.html | awk '{if (match ($0, /[0-9a-f]{40}/)) {print substr ($0, RSTART, RLENGTH)}}')
+          echo "${HASH}"
+          echo "${SELECT^^}_COMMIT_ID=${HASH}" >> ${GITHUB_OUTPUT}
+          echo "HASH=${HASH}" >> ${GITHUB_ENV}
+      - name: Cache ${{ matrix.select }} headers
+        uses: actions/cache@v4
+        id: headers-cache
+        with:
+          path: ${{ env.MSYSROOT }}/usr/include
+          key: ${{ env.SELECT }}-headers-${{ env.HASH }}
+      - name: Skip build
+        if: ${{ steps.headers-cache.outputs.cache-hit == 'true' }}
+        run: exit 0
+      - name: Install tools
+        if: ${{ steps.headers-cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y axel flex bison ncurses-dev texinfo gcc make libtool bc autoconf build-essential pkg-config tar lzip git autopoint gettext help2man txt2man libssl-dev wget
+      - name: Create directory
+        if: ${{ steps.headers-cache.outputs.cache-hit != 'true' }}
+        run: mkdir -vp ${SOURCE_DIR} ${OUTPUT_DIR} ${MSYSROOT}/usr/include
+      - name: Clone ${{ matrix.select }}
+        if: ${{ steps.headers-cache.outputs.cache-hit != 'true' }}
+        run: |
+          if [[ "${SELECT}" == "linux" ]]; then
+            git clone git://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux ${SOURCE_DIR}/${SELECT} -b master --depth=1
+          elif [[ "${SELECT}" == "musl" ]]; then
+            git clone git://git.musl-libc.org/musl ${SOURCE_DIR}/${SELECT} -b master --depth=1
+          fi
+      - name: Make ${{ matrix.select }} headers
+        if: ${{ steps.headers-cache.outputs.cache-hit != 'true' }}
+        run: |
+          cd ${SOURCE_DIR}/${SELECT}
+          if [[ "${SELECT}" == "linux" ]]; then
+            make ARCH=arm64 mrproper -j$(nproc --all)
+            make O="${OUTPUT_DIR}/linux" ARCH=arm64 INSTALL_HDR_PATH="${MSYSROOT}/usr" headers_install -j$(nproc --all)
+          elif [[ "${SELECT}" == "musl" ]]; then
+            make ARCH="aarch64" prefix="/usr" DESTDIR="${MSYSROOT}" install-headers -j$(nproc --all)
+          fi
+
+  build-gmp:
+    runs-on: ubuntu-latest
+    outputs:
+      GMP_VERSION: ${{ steps.version.outputs.GMP_VERSION }}
+    steps:
+      - name: Wget html file
+        run: wget -P ${HOME} -O "gmp.html" "https://ftp.gnu.org/gnu/gmp/?C=M;O=D"
+      - name: Get latest gmp version
+        id: version
+        run: |
+          GMP_VERSION=$(grep -m 1 '>gmp-.*\.tar\.xz<' ${HOME}/gmp.html | awk '{match($0, />gmp-[\.0-9]*\</); print substr($0, RSTART+5, RLENGTH-6)}')
+          echo "${GMP_VERSION}"
+          echo "GMP_VERSION=${GMP_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "GMP_VERSION=${GMP_VERSION}" >> ${GITHUB_ENV}
+      - name: Cache gmp
+        uses: actions/cache@v4
+        id: gmp-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/gmp
+          key: gmp-${{ env.GMP_VERSION }}
+      - name: Skip build
+        if: ${{ steps.gmp-cache.outputs.cache-hit == 'true' }}
+        run: exit 0
+      - name: Install tools
+        if: ${{ steps.gmp-cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y axel flex bison ncurses-dev texinfo gcc make libtool bc autoconf build-essential pkg-config tar lzip git autopoint gettext help2man txt2man libssl-dev wget
+      - name: Create directory
+        if: ${{ steps.gmp-cache.outputs.cache-hit != 'true' }}
+        run: mkdir -vp ${SOURCE_DIR} ${OUTPUT_DIR} ${WGET_DIR} ${BUILD_DIR}/build-gmp
+      - name: Wget and unzip gmp-${{ env.GMP_VERSION }}
+        if: ${{ steps.gmp-cache.outputs.cache-hit != 'true' }}
+        run: |
+          wget -P ${WGET_DIR} https://ftp.gnu.org/gnu/gmp/gmp-${GMP_VERSION}.tar.xz
+          tar -xJvf ${WGET_DIR}/gmp-${GMP_VERSION}.tar.xz -C ${SOURCE_DIR}
+      - name: Make gmp
+        if: ${{ steps.gmp-cache.outputs.cache-hit != 'true' }}
+        run: |
+          cd ${BUILD_DIR}/build-gmp
+          ${SOURCE_DIR}/gmp-${GMP_VERSION}/configure --prefix="${OUTPUT_DIR}/gmp"
+          make all -j$(nproc --all)
+          make install -j$(nproc --all)
+
+  build-isl:
+    needs: [ build-gmp ]
+    runs-on: ubuntu-latest
+    env:
+      GMP_VERSION: ${{ needs.build-gmp.outputs.GMP_VERSION }}
+    outputs:
+      ISL_VERSION: ${{ steps.version.outputs.ISL_VERSION }}
+    steps:
+      - name: Wget html file
+        run: wget -P ${HOME} -O "isl.html" "https://libisl.sourceforge.io/?C=M;O=D"
+      - name: Get latest isl version
+        id: version
+        run: |
+          ISL_VERSION=$(grep -m 1 '>isl-.*\.tar\.gz<' ${HOME}/isl.html | awk '{match($0, />isl-[\.0-9]*\</); print substr($0, RSTART+5, RLENGTH-6)}')
+          echo "${ISL_VERSION}"
+          echo "ISL_VERSION=${ISL_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "ISL_VERSION=${ISL_VERSION}" >> ${GITHUB_ENV}
+      - name: Cache isl
+        uses: actions/cache@v4
+        id: isl-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/isl
+          key: isl-${{ env.ISL_VERSION }}-gmp${{ env.GMP_VERSION }}
+      - name: Skip build
+        if: ${{ steps.isl-cache.outputs.cache-hit == 'true' }}
+        run: exit 0
+      - name: Cache gmp
+        if: ${{ steps.isl-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v4
+        id: gmp-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/gmp
+          key: gmp-${{ env.GMP_VERSION }}
+      - name: Install tools
+        if: ${{ steps.isl-cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y axel flex bison ncurses-dev texinfo gcc make libtool bc autoconf build-essential pkg-config tar lzip git autopoint gettext help2man txt2man libssl-dev wget
+      - name: Create directory
+        if: ${{ steps.isl-cache.outputs.cache-hit != 'true' }}
+        run: mkdir -vp ${SOURCE_DIR} ${OUTPUT_DIR}/isl ${WGET_DIR} ${BUILD_DIR}/build-isl
+      - name: Wget and unzip isl-${{ env.ISL_VERSION }}
+        if: ${{ steps.isl-cache.outputs.cache-hit != 'true' }}
+        run: |
+          wget -P ${WGET_DIR} https://libisl.sourceforge.io/isl-${ISL_VERSION}.tar.gz
+          tar -xzvf ${WGET_DIR}/isl-${ISL_VERSION}.tar.gz -C ${SOURCE_DIR}
+      - name: Make isl
+        if: ${{ steps.isl-cache.outputs.cache-hit != 'true' }}
+        run: |
+          cd ${BUILD_DIR}/build-isl
+          ${SOURCE_DIR}/isl-${ISL_VERSION}/configure --prefix="${OUTPUT_DIR}/isl" --with-gmp="${OUTPUT_DIR}/gmp"
+          make all -j$(nproc --all)
+          make install -j$(nproc --all)
+
+  build-mpfr:
+    needs: [ build-gmp ]
+    runs-on: ubuntu-latest
+    env:
+      GMP_VERSION: ${{ needs.build-gmp.outputs.GMP_VERSION }}
+    outputs:
+      MPFR_VERSION: ${{ steps.version.outputs.MPFR_VERSION }}
+    steps:
+      - name: Wget html file
+        run: wget -P ${HOME} -O "mpfr.html" "https://ftp.gnu.org/gnu/mpfr/?C=M;O=D"
+      - name: Get latest mpfr version
+        id: version
+        run: |
+          MPFR_VERSION=$(grep -m 1 '>mpfr-.*\.tar\.gz<' ${HOME}/mpfr.html | awk '{match($0, />mpfr-[\.0-9]*\</); print substr($0, RSTART+6, RLENGTH-7)}')
+          echo "${MPFR_VERSION}"
+          echo "MPFR_VERSION=${MPFR_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "MPFR_VERSION=${MPFR_VERSION}" >> ${GITHUB_ENV}
+      - name: Cache mpfr
+        uses: actions/cache@v4
+        id: mpfr-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/mpfr
+          key: mpfr-${{ env.MPFR_VERSION }}-gmp${{ env.GMP_VERSION }}
+      - name: Skip build
+        if: ${{ steps.mpfr-cache.outputs.cache-hit == 'true' }}
+        run: exit 0
+      - name: Cache gmp
+        if: ${{ steps.mpfr-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v4
+        id: gmp-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/gmp
+          key: gmp-${{ env.GMP_VERSION }}
+      - name: Install tools
+        if: ${{ steps.mpfr-cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y axel flex bison ncurses-dev texinfo gcc make libtool bc autoconf build-essential pkg-config tar lzip git autopoint gettext help2man txt2man libssl-dev wget
+      - name: Create directory
+        if: ${{ steps.mpfr-cache.outputs.cache-hit != 'true' }}
+        run: mkdir -vp ${SOURCE_DIR} ${OUTPUT_DIR}/mpfr ${WGET_DIR} ${BUILD_DIR}/build-mpfr
+      - name: Wget and unzip mpfr-${{ env.MPFR_VERSION }}
+        if: ${{ steps.mpfr-cache.outputs.cache-hit != 'true' }}
+        run: |
+          wget -P ${WGET_DIR} https://ftp.gnu.org/gnu/mpfr/mpfr-${MPFR_VERSION}.tar.gz
+          tar -xzvf ${WGET_DIR}/mpfr-${MPFR_VERSION}.tar.gz -C ${SOURCE_DIR}
+      - name: Make mpfr
+        if: ${{ steps.mpfr-cache.outputs.cache-hit != 'true' }}
+        run: |
+          cd ${BUILD_DIR}/build-mpfr
+          ${SOURCE_DIR}/mpfr-${MPFR_VERSION}/configure --prefix="${OUTPUT_DIR}/mpfr" --with-gmp="${OUTPUT_DIR}/gmp"
+          make all -j$(nproc --all)
+          make install -j$(nproc --all)
+
+  build-mpc:
+    needs: [ build-gmp, build-mpfr ]
+    runs-on: ubuntu-latest
+    env:
+      GMP_VERSION: ${{ needs.build-gmp.outputs.GMP_VERSION }}
+      MPFR_VERSION: ${{ needs.build-mpfr.outputs.MPFR_VERSION }}
+    outputs:
+      MPC_VERSION: ${{ steps.version.outputs.MPC_VERSION }}
+    steps:
+      - name: Wget html file
+        run: wget -P ${HOME} -O "mpc.html" "https://ftp.gnu.org/gnu/mpc/?C=M;O=D"
+      - name: Get latest mpc version
+        id: version
+        run: |
+          MPC_VERSION=$(grep -m 1 '>mpc-.*\.tar\.gz<' ${HOME}/mpc.html | awk '{match($0, />mpc-[\.0-9]*\</); print substr($0, RSTART+5, RLENGTH-6)}')
+          echo "${MPC_VERSION}"
+          echo "MPC_VERSION=${MPC_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "MPC_VERSION=${MPC_VERSION}" >> ${GITHUB_ENV}
+      - name: Cache mpc
+        uses: actions/cache@v4
+        id: mpc-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/mpc
+          key: mpc-${{ env.MPC_VERSION }}-gmp${{ env.GMP_VERSION }}-mpfr${{ env.MPFR_VERSION }}
+      - name: Skip build
+        if: ${{ steps.mpc-cache.outputs.cache-hit == 'true' }}
+        run: exit 0
+      - name: Cache gmp
+        if: ${{ steps.mpc-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v4
+        id: gmp-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/gmp
+          key: gmp-${{ env.GMP_VERSION }}
+      - name: Cache mpfr
+        if: ${{ steps.mpc-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache@v4
+        id: mpfr-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/mpfr
+          key: mpfr-${{ env.MPFR_VERSION }}-gmp${{ env.GMP_VERSION }}
+      - name: Install tools
+        if: ${{ steps.mpc-cache.outputs.cache-hit != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y axel flex bison ncurses-dev texinfo gcc make libtool bc autoconf build-essential pkg-config tar lzip git autopoint gettext help2man txt2man libssl-dev wget
+      - name: Create directory
+        if: ${{ steps.mpc-cache.outputs.cache-hit != 'true' }}
+        run: mkdir -vp ${SOURCE_DIR} ${OUTPUT_DIR}/mpc ${WGET_DIR} ${BUILD_DIR}/build-mpc
+      - name: Wget and unzip mpc-${{ env.MPC_VERSION }}
+        if: ${{ steps.mpc-cache.outputs.cache-hit != 'true' }}
+        run: |
+          wget -P ${WGET_DIR} https://ftp.gnu.org/gnu/mpc/mpc-${MPC_VERSION}.tar.gz
+          tar -xzvf ${WGET_DIR}/mpc-${MPC_VERSION}.tar.gz -C ${SOURCE_DIR}
+      - name: Make mpc
+        if: ${{ steps.mpc-cache.outputs.cache-hit != 'true' }}
+        run: |
+          cd ${BUILD_DIR}/build-mpc
+          ${SOURCE_DIR}/mpc-${MPC_VERSION}/configure --prefix="${OUTPUT_DIR}/mpc" --with-gmp="${OUTPUT_DIR}/gmp" --with-mpfr="${OUTPUT_DIR}/mpfr"
+          make all -j$(nproc --all)
+          make install -j$(nproc --all)
+
+  build-gcc-and-push:
+    needs: [ make-headers, build-gmp, build-isl, build-mpfr, build-mpc ]
+    runs-on: ubuntu-latest
+    env:
+      LINUX_COMMIT_ID: ${{ needs.make-headers.outputs.LINUX_COMMIT_ID }}
+      MUSL_COMMIT_ID: ${{ needs.make-headers.outputs.MUSL_COMMIT_ID }}
+      GMP_VERSION: ${{ needs.build-gmp.outputs.GMP_VERSION }}
+      ISL_VERSION: ${{ needs.build-isl.outputs.ISL_VERSION }}
+      MPFR_VERSION: ${{ needs.build-mpfr.outputs.MPFR_VERSION }}
+      MPC_VERSION: ${{ needs.build-mpc.outputs.MPC_VERSION }}
+    steps:
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y axel flex bison ncurses-dev texinfo gcc make libtool bc autoconf build-essential pkg-config tar lzip git autopoint gettext help2man txt2man libssl-dev wget
+      - name: Create directory
+        run: mkdir -vp ${SOURCE_DIR} ${OUTPUT_DIR}/{gmp,mpfr,mpc,isl} ${MPREFIX} ${MSYSROOT}/usr/include ${BUILD_DIR}/{build-binutils,build-gcc,build-musl}
+      - name: Cache linux headers
+        uses: actions/cache@v4
+        id: linux-headers-cache
+        with:
+          path: ${{ env.MSYSROOT }}/usr/include
+          key: linux-headers-${{ env.LINUX_COMMIT_ID }}
+      - name: Cache musl headers
+        uses: actions/cache@v4
+        id: musl-headers-cache
+        with:
+          path: ${{ env.MSYSROOT }}/usr/include
+          key: musl-headers-${{ env.MUSL_COMMIT_ID }}
+      - name: Cache gmp
+        uses: actions/cache@v4
+        id: gmp-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/gmp
+          key: gmp-${{ env.GMP_VERSION }}
+      - name: Cache isl
+        uses: actions/cache@v4
+        id: isl-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/isl
+          key: isl-${{ env.ISL_VERSION }}-gmp${{ env.GMP_VERSION }}
+      - name: Cache mpfr
+        uses: actions/cache@v4
+        id: mpfr-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/mpfr
+          key: mpfr-${{ env.MPFR_VERSION }}-gmp${{ env.GMP_VERSION }}
+      - name: Cache mpc
+        uses: actions/cache@v4
+        id: mpc-cache
+        with:
+          path: ${{ env.OUTPUT_DIR }}/mpc
+          key: mpc-${{ env.MPC_VERSION }}-gmp${{ env.GMP_VERSION }}-mpfr${{ env.MPFR_VERSION }}
+      - name: Clone binutils
+        run: git clone git://sourceware.org/git/binutils-gdb ${SOURCE_DIR}/binutils -b master --depth=1
+      - name: Clone gcc
+        run: git clone git://gcc.gnu.org/git/gcc ${SOURCE_DIR}/gcc -b master --depth=1
+      - name: Clone musl
+        run: git clone git://git.musl-libc.org/musl ${SOURCE_DIR}/musl -b master --depth=1
+      - name: Configure binutils
+        run: |
+          cd ${BUILD_DIR}/build-binutils
+          ${SOURCE_DIR}/binutils/configure --target="aarch64-linux-musl" --prefix="${MPREFIX}" --with-sysroot="${MSYSROOT}" --disable-multilib --disable-werro --with-gmp="${OUTPUT_DIR}/gmp" --with-mpc="${OUTPUT_DIR}/mpc" --with-mpfr="${OUTPUT_DIR}/mpfr" --with-isl="${OUTPUT_DIR}/isl"
+      - name: Make binutils
+        run: |
+          cd ${BUILD_DIR}/build-binutils
+          make all-binutils all-gas all-ld -j$(nproc --all)
+          make install-strip-binutils install-strip-gas install-strip-ld -j$(nproc --all)
+      - name: Configure gcc
+        run: |
+          cd ${BUILD_DIR}/build-gcc
+          ${SOURCE_DIR}/gcc/configure --target="aarch64-linux-musl" --prefix="${MPREFIX}" --with-sysroot="${MSYSROOT}" --enable-languages="c,c++" --disable-multilib --disable-bootstrap --disable-libsanitizer --disable-werror --enable-initfini-array --with-arch=armv8-a --with-abi=lp64 --enable-fix-cortex-a53-835769 --enable-fix-cortex-a53-843419 --with-gmp="${OUTPUT_DIR}/gmp" --with-mpc="${OUTPUT_DIR}/mpc" --with-mpfr="${OUTPUT_DIR}/mpfr" --with-isl="${OUTPUT_DIR}/isl"
+      - name: Make gcc (compiler)
+        run: |
+          cd ${BUILD_DIR}/build-gcc
+          make all-gcc -j$(nproc --all)
+          make install-strip-gcc -j$(nproc --all)
+      - name: Make gcc (libgcc-static)
+        run: |
+          cd ${BUILD_DIR}/build-gcc
+          make enable_shared=no all-target-libgcc -j$(nproc --all)
+          make install-strip-target-libgcc -j$(nproc --all)
+      - name: Configure musl
+        run: |
+          cd ${BUILD_DIR}/build-musl
+          export LIBCC_DIR=$(find ${MPREFIX}/lib/gcc/aarch64-linux-musl -maxdepth 1 -type d -name "[0-9]*")
+          export ARCH="aarch64"
+          export CC="aarch64-linux-musl-gcc"
+          export CROSS_COMPILE="aarch64-linux-musl-"
+          export LIBCC="${LIBCC_DIR}/libgcc.a"
+          ${SOURCE_DIR}/musl/configure --host="aarch64-linux-musl" --prefix="/usr"
+      - name: Make musl
+        run: |
+          cd ${BUILD_DIR}/build-musl
+          make AR="aarch64-linux-musl-ar" RANLIB="aarch64-linux-musl-ranlib" -j$(nproc --all)
+          make AR="aarch64-linux-musl-ar" RANLIB="aarch64-linux-musl-ranlib" DESTDIR="${MSYSROOT}" install -j$(nproc --all)
+          rm -vf ${MSYSROOT}/lib/ld-musl-aarch64.so.1
+          cp -avf ${MSYSROOT}/usr/lib/libc.so ${MSYSROOT}/lib/ld-musl-aarch64.so.1
+      - name: Make gcc (libgcc-shared)
+        run: |
+          cd ${BUILD_DIR}/build-gcc
+          make -C aarch64-linux-musl/libgcc distclean -j$(nproc --all)
+          make enable_shared=yes all-target-libgcc -j$(nproc --all)
+          make install-strip-target-libgcc -j$(nproc --all)
+      - name: Make gcc (libstdc++-v3)
+        run: |
+          cd ${BUILD_DIR}/build-gcc
+          make all-target-libstdc++-v3 -j$(nproc --all)
+          make install-strip-target-libstdc++-v3 -j$(nproc --all)
+      - name: Make gcc (libgomp)
+        run: |
+          cd ${BUILD_DIR}/build-gcc
+          make all-target-libgomp -j$(nproc --all)
+          make install-strip-target-libgomp -j$(nproc --all)
+      - name: Merge directory
+        run: cp -avf ${MSYSROOT}/lib ${MSYSROOT}/usr/* ${MPREFIX}/aarch64-linux-musl
+      - name: Push
+        run: |
+          git config --global user.name "${GITHUB_USER}"
+          git config --global user.email "${GITHUB_EMAIL}"
+          git clone https://"${GITHUB_USER}":"${GITHUB_TOKEN}"@github.com/chase535/aarch64-linux-musl-gcc ${CLONE_DIR} -b main --depth=1
+          cd ${CLONE_DIR}
+          git checkout --orphan new
+          OLD_FILES=`find . -maxdepth 1 -not \( -type d -name "." -o -type d -name ".git" -o -type d -name ".github" -o -type f -name "README.md" \)`
+          [ -n "${OLD_FILES}" ] && rm -rf ${OLD_FILES}
+          cp -avf ${MPREFIX}/* ${CLONE_DIR}
+          chmod -R 0777 ${CLONE_DIR}
+          git branch -D main
+          git branch -m main
+          git add . -f
+          git commit -as -m "$(${CLONE_DIR}/bin/aarch64-linux-musl-gcc --version)"
+          git push -f origin main
